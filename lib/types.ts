@@ -126,6 +126,13 @@ export type OrderWithRelations = OrderRow & {
   gifts?: OrderGiftRow[];
 };
 
+export type ExpenseCategory = {
+  id: string;
+  name: string;
+  sort_order: number;
+  created_at: string;
+};
+
 export type Expense = {
   id: string;
   title: string;
@@ -135,6 +142,17 @@ export type Expense = {
   notes: string | null;
   expense_date: string;
   created_at: string;
+  created_by: string | null; // staff name, or "Admin"; null for rows from before this was tracked
+  created_by_role: 'admin' | 'staff' | null;
+};
+
+export type ActionResult<T> = { ok: true; data: T } | { ok: false; error: string };
+
+export type ExpenseEditWindow = 'same_day' | '24h' | '7d' | 'never';
+
+export type ExpenseSettings = {
+  staffEditWindow: ExpenseEditWindow; // how long staff may edit/delete their own expenses
+  staffShowTotals: boolean; // let staff see totals and the Spend by Category chart
 };
 
 export type AdvanceOrderStatus = 'PENDING' | 'READY' | 'COMPLETED' | 'CANCELLED';

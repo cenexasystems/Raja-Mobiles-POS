@@ -13,6 +13,8 @@ import {
   Gift,
   CartItem,
   Expense,
+  ExpenseCategory,
+  ExpenseSettings,
   PaymentMode,
   AdvanceOrderRow,
   AdvanceOrderItemRow,
@@ -20,6 +22,7 @@ import {
   AdvanceOrderWithRelations,
 } from './types';
 import { effectiveGstRate, gstInside } from './gst';
+import { DEFAULT_EXPENSE_SETTINGS } from './expensePolicy';
 
 // orders.bill_date is a Postgres DATE. The shop runs on India time, so turn whatever the client
 // sent (a plain YYYY-MM-DD, or a full ISO timestamp) into the IST calendar day. Casting a UTC ISO
@@ -71,26 +74,105 @@ function enrichProduct(
   };
 }
 
+const FALLBACK_EXPENSE_CATEGORY = 'Miscellaneous';
+const DEFAULT_EXPENSE_CATEGORIES = [
+  'Stock Purchase',
+  'Rent',
+  'Salaries',
+  'Utilities',
+  'Electricity',
+  'Transport',
+  'Marketing',
+  'Repairs & Maintenance',
+  'Taxes & Fees',
+  FALLBACK_EXPENSE_CATEGORY,
+];
+let expenseCategoriesReady: Promise<void> | null = null;
+const FALLBACK_PRODUCT_CATEGORY = 'General';
+let productCategoriesReady: Promise<void> | null = null;
+
 export const dbStore = {
-  // CATEGORIES
+  // CATEGORIES (product categories; products.category stores the NAME as text)
+  // Backfill is idempotent and mirrors db/migrations/003_product_categories_backfill.sql.
+  async ensureProductCategories(): Promise<void> {
+    if (!productCategoriesReady) {
+      productCategoriesReady = (async () => {
+        await sql`
+          INSERT INTO categories (id, name)
+          SELECT ${uid()}, ${FALLBACK_PRODUCT_CATEGORY}
+          WHERE NOT EXISTS (SELECT 1 FROM categories WHERE LOWER(name) = LOWER(${FALLBACK_PRODUCT_CATEGORY}))`;
+        await sql`
+          INSERT INTO categories (id, name)
+          SELECT gen_random_uuid()::text, s.c
+          FROM (SELECT MIN(TRIM(category)) AS c FROM products
+                WHERE category IS NOT NULL AND TRIM(category) <> ''
+                GROUP BY LOWER(TRIM(category))) s
+          WHERE NOT EXISTS (SELECT 1 FROM categories x WHERE LOWER(x.name) = LOWER(s.c))`;
+      })().catch((e) => {
+        productCategoriesReady = null;
+        throw e;
+      });
+    }
+    await productCategoriesReady;
+  },
+
   async listCategories(): Promise<Category[]> {
+    await this.ensureProductCategories();
     const rows = await sql`SELECT * FROM categories ORDER BY name ASC`;
     return rows as Category[];
   },
 
   async addCategory(name: string): Promise<Category> {
-    const id = uid();
+    await this.ensureProductCategories();
+    const existing = await sql`SELECT * FROM categories WHERE LOWER(name) = LOWER(${name}) LIMIT 1`;
+    if (existing.length > 0) return existing[0] as Category;
     const rows = await sql`
       INSERT INTO categories (id, name)
-      VALUES (${id}, ${name})
+      VALUES (${uid()}, ${name})
       ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
       RETURNING *
     `;
     return rows[0] as Category;
   },
 
-  async deleteCategory(id: string): Promise<void> {
-    await sql`DELETE FROM categories WHERE id = ${id}`;
+  // Renames the category and every product using the old name, atomically.
+  async renameCategory(id: string, newName: string): Promise<Category> {
+    await this.ensureProductCategories();
+    const existing = await sql`SELECT * FROM categories WHERE id = ${id}`;
+    if (existing.length === 0) throw new Error('Category not found.');
+    const oldName = (existing[0] as Category).name;
+    if (oldName.toLowerCase() === FALLBACK_PRODUCT_CATEGORY.toLowerCase()) {
+      throw new Error(`"${FALLBACK_PRODUCT_CATEGORY}" cannot be renamed.`);
+    }
+    if (newName.toLowerCase() === FALLBACK_PRODUCT_CATEGORY.toLowerCase()) {
+      throw new Error(`"${FALLBACK_PRODUCT_CATEGORY}" is reserved.`);
+    }
+    const clash = await sql`SELECT 1 FROM categories WHERE LOWER(name) = LOWER(${newName}) AND id <> ${id}`;
+    if (clash.length > 0) throw new Error(`A category named "${newName}" already exists.`);
+    const res = await sql.transaction([
+      sql`UPDATE categories SET name = ${newName} WHERE id = ${id} RETURNING *`,
+      sql`UPDATE products SET category = ${newName} WHERE category = ${oldName}`,
+    ]);
+    return (res[0] as unknown as Category[])[0];
+  },
+
+  // Deletes the category; its products move to "General" (never deleted itself).
+  async deleteCategory(id: string): Promise<{ reassigned: number }> {
+    await this.ensureProductCategories();
+    const existing = await sql`SELECT * FROM categories WHERE id = ${id}`;
+    if (existing.length === 0) return { reassigned: 0 };
+    const name = (existing[0] as Category).name;
+    if (name.toLowerCase() === FALLBACK_PRODUCT_CATEGORY.toLowerCase()) {
+      throw new Error(`"${FALLBACK_PRODUCT_CATEGORY}" cannot be deleted.`);
+    }
+    const res = await sql.transaction([
+      sql`INSERT INTO categories (id, name)
+          SELECT ${uid()}, ${FALLBACK_PRODUCT_CATEGORY}
+          WHERE NOT EXISTS (SELECT 1 FROM categories WHERE LOWER(name) = LOWER(${FALLBACK_PRODUCT_CATEGORY}))`,
+      sql`UPDATE products SET category = ${FALLBACK_PRODUCT_CATEGORY} WHERE category = ${name} RETURNING id`,
+      sql`DELETE FROM categories WHERE id = ${id}`,
+    ]);
+    return { reassigned: (res[1] as unknown[]).length };
   },
 
   // GIFTS (free add-ons; price is display-only, never in analytics)
@@ -395,13 +477,124 @@ export const dbStore = {
     await sql`DELETE FROM orders WHERE id = ${id}`;
   },
 
+  // EXPENSE CATEGORIES
+  // Expenses store the category *name* as text, so rename/delete also rewrite expenses.category.
+  // Table creation + seeding is idempotent (mirrors db/migrations/001_expense_categories.sql) and
+  // runs once per server instance, so deploys work even before the migration is applied by hand.
+  async ensureExpenseSchema(): Promise<void> {
+    if (!expenseCategoriesReady) {
+      expenseCategoriesReady = (async () => {
+        await sql`
+          CREATE TABLE IF NOT EXISTS expense_categories (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+          )`;
+        await sql`CREATE UNIQUE INDEX IF NOT EXISTS expense_categories_name_lower_key ON expense_categories (LOWER(name))`;
+        const seeded = await sql`SELECT 1 FROM expense_categories LIMIT 1`;
+        if (seeded.length === 0) {
+          for (let i = 0; i < DEFAULT_EXPENSE_CATEGORIES.length; i++) {
+            await sql`
+              INSERT INTO expense_categories (id, name, sort_order)
+              VALUES (${uid()}, ${DEFAULT_EXPENSE_CATEGORIES[i]}, ${i + 1})
+              ON CONFLICT DO NOTHING`;
+          }
+        }
+        await sql`
+          INSERT INTO expense_categories (id, name, sort_order)
+          SELECT gen_random_uuid()::text, c, 100
+          FROM (SELECT DISTINCT TRIM(category) AS c FROM expenses WHERE TRIM(category) <> '') s
+          ON CONFLICT DO NOTHING`;
+        // 002: audit columns + settings (db/migrations/002_expense_audit_and_settings.sql)
+        await sql`ALTER TABLE expenses ADD COLUMN IF NOT EXISTS created_by TEXT`;
+        await sql`ALTER TABLE expenses ADD COLUMN IF NOT EXISTS created_by_role TEXT`;
+        await sql`
+          CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+          )`;
+        await sql`
+          INSERT INTO app_settings (key, value) VALUES
+            ('staff_expense_edit_window', 'same_day'),
+            ('staff_expense_show_totals', 'false')
+          ON CONFLICT (key) DO NOTHING`;
+      })().catch((e) => {
+        expenseCategoriesReady = null;
+        throw e;
+      });
+    }
+    await expenseCategoriesReady;
+  },
+
+  async listExpenseCategories(): Promise<ExpenseCategory[]> {
+    await this.ensureExpenseSchema();
+    const rows = await sql`SELECT * FROM expense_categories ORDER BY sort_order ASC, name ASC`;
+    return rows as ExpenseCategory[];
+  },
+
+  async addExpenseCategory(name: string): Promise<ExpenseCategory> {
+    await this.ensureExpenseSchema();
+    const rows = await sql`
+      INSERT INTO expense_categories (id, name, sort_order)
+      VALUES (${uid()}, ${name}, 100)
+      ON CONFLICT (LOWER(name)) DO UPDATE SET name = expense_categories.name
+      RETURNING *`;
+    return rows[0] as ExpenseCategory;
+  },
+
+  // Renames the category and every expense using the old name, atomically.
+  async renameExpenseCategory(id: string, newName: string): Promise<ExpenseCategory> {
+    await this.ensureExpenseSchema();
+    const existing = await sql`SELECT * FROM expense_categories WHERE id = ${id}`;
+    if (existing.length === 0) throw new Error('Category not found.');
+    const oldName = (existing[0] as ExpenseCategory).name;
+    if (oldName === FALLBACK_EXPENSE_CATEGORY) {
+      throw new Error(`"${FALLBACK_EXPENSE_CATEGORY}" cannot be renamed.`);
+    }
+    const clash = await sql`SELECT 1 FROM expense_categories WHERE LOWER(name) = LOWER(${newName}) AND id <> ${id}`;
+    if (clash.length > 0) throw new Error(`A category named "${newName}" already exists.`);
+    const res = await sql.transaction([
+      sql`UPDATE expense_categories SET name = ${newName} WHERE id = ${id} RETURNING *`,
+      sql`UPDATE expenses SET category = ${newName} WHERE category = ${oldName}`,
+    ]);
+    return (res[0] as unknown as ExpenseCategory[])[0];
+  },
+
+  // Deletes the category; expenses that used it move to "Miscellaneous" (created if missing).
+  async deleteExpenseCategory(id: string): Promise<{ reassigned: number }> {
+    await this.ensureExpenseSchema();
+    const existing = await sql`SELECT * FROM expense_categories WHERE id = ${id}`;
+    if (existing.length === 0) return { reassigned: 0 };
+    const name = (existing[0] as ExpenseCategory).name;
+    if (name === FALLBACK_EXPENSE_CATEGORY) {
+      throw new Error(`"${FALLBACK_EXPENSE_CATEGORY}" cannot be deleted.`);
+    }
+    const res = await sql.transaction([
+      sql`INSERT INTO expense_categories (id, name, sort_order)
+          VALUES (${uid()}, ${FALLBACK_EXPENSE_CATEGORY}, 10)
+          ON CONFLICT (LOWER(name)) DO NOTHING`,
+      sql`UPDATE expenses SET category = ${FALLBACK_EXPENSE_CATEGORY} WHERE category = ${name} RETURNING id`,
+      sql`DELETE FROM expense_categories WHERE id = ${id}`,
+    ]);
+    return { reassigned: (res[1] as unknown[]).length };
+  },
+
   // EXPENSES
   async listExpenses(): Promise<Expense[]> {
+    await this.ensureExpenseSchema();
     const rows = await sql`
       SELECT * FROM expenses
       ORDER BY expense_date DESC, created_at DESC
     `;
     return rows as Expense[];
+  },
+
+  async getExpense(id: string): Promise<Expense | null> {
+    await this.ensureExpenseSchema();
+    const rows = await sql`SELECT * FROM expenses WHERE id = ${id}`;
+    return rows.length > 0 ? (rows[0] as Expense) : null;
   },
 
   async addExpense(input: {
@@ -411,17 +604,47 @@ export const dbStore = {
     payment_mode: string;
     notes: string | null;
     expense_date: string;
+    created_by: string;
+    created_by_role: 'admin' | 'staff';
   }): Promise<Expense> {
+    await this.ensureExpenseSchema();
     const id = uid();
     const rows = await sql`
-      INSERT INTO expenses (id, title, category, amount, payment_mode, notes, expense_date)
+      INSERT INTO expenses (id, title, category, amount, payment_mode, notes, expense_date, created_by, created_by_role)
       VALUES (
         ${id}, ${input.title}, ${input.category}, ${input.amount},
-        ${input.payment_mode}, ${input.notes}, ${input.expense_date}
+        ${input.payment_mode}, ${input.notes}, ${input.expense_date},
+        ${input.created_by}, ${input.created_by_role}
       )
       RETURNING *
     `;
     return rows[0] as Expense;
+  },
+
+  // EXPENSE SETTINGS (adjustable staff permissions)
+  async getExpenseSettings(): Promise<ExpenseSettings> {
+    await this.ensureExpenseSchema();
+    const rows = await sql`
+      SELECT key, value FROM app_settings
+      WHERE key IN ('staff_expense_edit_window', 'staff_expense_show_totals')`;
+    const map = Object.fromEntries(rows.map((r) => [r.key as string, r.value as string]));
+    const win = map['staff_expense_edit_window'];
+    return {
+      staffEditWindow: (['same_day', '24h', '7d', 'never'] as const).find((w) => w === win)
+        ?? DEFAULT_EXPENSE_SETTINGS.staffEditWindow,
+      staffShowTotals: map['staff_expense_show_totals'] === 'true',
+    };
+  },
+
+  async setExpenseSettings(s: ExpenseSettings): Promise<ExpenseSettings> {
+    await this.ensureExpenseSchema();
+    await sql.transaction([
+      sql`INSERT INTO app_settings (key, value) VALUES ('staff_expense_edit_window', ${s.staffEditWindow})
+          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      sql`INSERT INTO app_settings (key, value) VALUES ('staff_expense_show_totals', ${s.staffShowTotals ? 'true' : 'false'})
+          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+    ]);
+    return s;
   },
 
   async updateExpense(id: string, patch: Partial<Expense>): Promise<Expense | null> {

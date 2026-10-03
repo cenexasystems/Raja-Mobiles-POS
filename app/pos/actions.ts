@@ -1,7 +1,9 @@
 "use server";
 
 import { dbStore } from "@/lib/dbStore";
-import { Product, ProductBatch, ProductWithBatches, ProductUnit, OrderWithRelations, CartItem, Expense, PaymentMode, Category, Gift, AdvanceOrderWithRelations, AdvanceOrderStatus } from "@/lib/types";
+import { requireSession, requireAdmin, getSession, startSession, endSession, Session } from "@/lib/auth";
+import { canModifyExpense } from "@/lib/expensePolicy";
+import { Product, ProductBatch, ProductWithBatches, ProductUnit, OrderWithRelations, CartItem, Expense, ExpenseCategory, ExpenseSettings, ActionResult, PaymentMode, Category, Gift, AdvanceOrderWithRelations, AdvanceOrderStatus } from "@/lib/types";
 
 // Helper to serialize Date objects from Postgres to strings
 function serialize<T>(data: T): T {
@@ -9,20 +11,37 @@ function serialize<T>(data: T): T {
   return JSON.parse(JSON.stringify(data));
 }
 
-export async function verifyPasscode(enteredPasscode: string): Promise<{ success: boolean; role?: 'staff' | 'admin' }> {
+// ── Session / auth ──────────────────────────────────────────────────
+// Role and staff name come from a signed httpOnly cookie (lib/auth.ts), never from the client.
+export async function verifyPasscode(
+  enteredPasscode: string,
+  staffName?: string,
+): Promise<{ success: boolean; role?: 'staff' | 'admin'; name?: string; error?: string }> {
   const adminPasscode = process.env.ADMIN_PASSCODE || "admin123";
   const staffPasscode = process.env.STAFF_PASSCODE || process.env.NEXT_PUBLIC_STAFF_PASSCODE || "staff123";
 
   const normalizedEntered = enteredPasscode.replace(/\s/g, "");
 
   if (normalizedEntered === adminPasscode) {
-    return { success: true, role: 'admin' };
+    await startSession({ role: 'admin', name: 'Admin' });
+    return { success: true, role: 'admin', name: 'Admin' };
   }
   if (normalizedEntered === staffPasscode) {
-    return { success: true, role: 'staff' };
+    const name = (staffName || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+    if (!name) return { success: false, error: 'Please enter your name.' };
+    await startSession({ role: 'staff', name });
+    return { success: true, role: 'staff', name };
   }
 
   return { success: false };
+}
+
+export async function fetchSession(): Promise<Session | null> {
+  return await getSession();
+}
+
+export async function logoutSession(): Promise<void> {
+  await endSession();
 }
 
 // Categories
@@ -30,12 +49,31 @@ export async function fetchCategories(): Promise<Category[]> {
   return serialize(await dbStore.listCategories());
 }
 
-export async function createCategory(name: string): Promise<Category> {
-  return serialize(await dbStore.addCategory(name.trim()));
+// Product categories. Staff may pick/add; rename and delete are admin-only (checked on the server).
+// Mutations return { ok, data | error } because Next hides thrown error messages in production.
+export async function createCategory(name: string): Promise<ActionResult<Category>> {
+  return guard(async () => {
+    await requireSession();
+    const clean = name.trim().slice(0, 60);
+    if (!clean) throw new Error('Category name is required.');
+    return await dbStore.addCategory(clean);
+  });
 }
 
-export async function removeCategory(id: string): Promise<void> {
-  return await dbStore.deleteCategory(id);
+export async function renameCategory(id: string, name: string): Promise<ActionResult<Category>> {
+  return guard(async () => {
+    await requireAdmin();
+    const clean = name.trim().slice(0, 60);
+    if (!clean) throw new Error('Category name is required.');
+    return await dbStore.renameCategory(id, clean);
+  });
+}
+
+export async function removeCategory(id: string): Promise<ActionResult<{ reassigned: number }>> {
+  return guard(async () => {
+    await requireAdmin();
+    return await dbStore.deleteCategory(id);
+  });
 }
 
 // Products
@@ -151,28 +189,148 @@ export async function removeOrder(id: string): Promise<void> {
   return await dbStore.deleteOrder(id);
 }
 
-// Expenses
-export async function fetchExpenses(): Promise<Expense[]> {
-  return serialize(await dbStore.listExpenses());
+// ── Expense categories ──────────────────────────────────────────────
+// Staff may list and ADD categories; renaming/deleting is admin-only.
+// Mutations return { ok, data | error } because Next hides thrown error messages in production.
+async function guard<T>(fn: () => Promise<T>): Promise<ActionResult<T>> {
+  try {
+    return { ok: true, data: serialize(await fn()) };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Something went wrong.' };
+  }
 }
 
-export async function createExpense(data: {
+export async function fetchExpenseCategories(): Promise<ExpenseCategory[]> {
+  await requireSession();
+  return serialize(await dbStore.listExpenseCategories());
+}
+
+export async function createExpenseCategory(name: string): Promise<ActionResult<ExpenseCategory>> {
+  return guard(async () => {
+    await requireSession();
+    const clean = name.trim().slice(0, 60);
+    if (!clean) throw new Error('Category name is required.');
+    return await dbStore.addExpenseCategory(clean);
+  });
+}
+
+export async function renameExpenseCategory(id: string, name: string): Promise<ActionResult<ExpenseCategory>> {
+  return guard(async () => {
+    await requireAdmin();
+    const clean = name.trim().slice(0, 60);
+    if (!clean) throw new Error('Category name is required.');
+    return await dbStore.renameExpenseCategory(id, clean);
+  });
+}
+
+export async function removeExpenseCategory(id: string): Promise<ActionResult<{ reassigned: number }>> {
+  return guard(async () => {
+    await requireAdmin();
+    return await dbStore.deleteExpenseCategory(id);
+  });
+}
+
+// ── Expense settings (adjustable staff permissions) ─────────────────
+export async function fetchExpenseSettings(): Promise<ExpenseSettings> {
+  await requireSession();
+  return await dbStore.getExpenseSettings();
+}
+
+export async function saveExpenseSettings(settings: ExpenseSettings): Promise<ActionResult<ExpenseSettings>> {
+  return guard(async () => {
+    await requireAdmin();
+    if (!['same_day', '24h', '7d', 'never'].includes(settings.staffEditWindow)) {
+      throw new Error('Invalid edit window.');
+    }
+    return await dbStore.setExpenseSettings({
+      staffEditWindow: settings.staffEditWindow,
+      staffShowTotals: Boolean(settings.staffShowTotals),
+    });
+  });
+}
+
+// ── Expenses ────────────────────────────────────────────────────────
+const EXPENSE_PAYMENT_MODES = ['CASH', 'UPI', 'CARD', 'BANK', 'OTHER'];
+
+type ExpenseInput = {
   title: string;
   category: string;
   amount: number;
   payment_mode: string;
   notes: string | null;
   expense_date: string;
-}): Promise<Expense> {
-  return serialize(await dbStore.addExpense(data));
+};
+
+// Validates user input and resolves the category to its canonical stored name.
+async function cleanExpenseInput(data: ExpenseInput): Promise<ExpenseInput> {
+  const title = String(data.title ?? '').trim().slice(0, 200);
+  if (!title) throw new Error('Please enter what the expense was for.');
+  const amount = Number(data.amount);
+  if (!isFinite(amount) || amount <= 0 || amount > 100000000) {
+    throw new Error('Please enter a valid amount greater than 0.');
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(data.expense_date))) throw new Error('Please pick a valid date.');
+  if (!EXPENSE_PAYMENT_MODES.includes(data.payment_mode)) throw new Error('Invalid payment mode.');
+  const cats = await dbStore.listExpenseCategories();
+  const cat = cats.find((c) => c.name.toLowerCase() === String(data.category ?? '').trim().toLowerCase());
+  if (!cat) throw new Error('Unknown category. Pick one from the list.');
+  return {
+    title,
+    category: cat.name,
+    amount,
+    payment_mode: data.payment_mode,
+    notes: data.notes?.trim().slice(0, 500) || null,
+    expense_date: data.expense_date,
+  };
 }
 
-export async function editExpense(id: string, data: Partial<Expense>): Promise<Expense | null> {
-  return serialize(await dbStore.updateExpense(id, data));
+export async function fetchExpenses(): Promise<Expense[]> {
+  await requireSession();
+  return serialize(await dbStore.listExpenses());
 }
 
-export async function removeExpense(id: string): Promise<void> {
-  return await dbStore.deleteExpense(id);
+// created_by / created_by_role always come from the session, never from the client.
+export async function createExpense(data: ExpenseInput): Promise<ActionResult<Expense>> {
+  return guard(async () => {
+    const session = await requireSession();
+    const clean = await cleanExpenseInput(data);
+    return await dbStore.addExpense({
+      ...clean,
+      created_by: session.name,
+      created_by_role: session.role,
+    });
+  });
+}
+
+// Checks the caller may modify the expense (admin: any; staff: own, inside the allowed window).
+async function assertCanModifyExpense(id: string, session: Session): Promise<void> {
+  const expense = await dbStore.getExpense(id);
+  if (!expense) throw new Error('Expense not found.');
+  const settings = await dbStore.getExpenseSettings();
+  if (!canModifyExpense(expense, session, settings)) {
+    throw new Error('You can only change expenses you added, within the allowed time.');
+  }
+}
+
+export async function editExpense(id: string, data: ExpenseInput): Promise<ActionResult<Expense>> {
+  return guard(async () => {
+    const session = await requireSession();
+    await assertCanModifyExpense(id, session);
+    const clean = await cleanExpenseInput(data);
+    // Only these fields are writable; created_by / created_at never change.
+    const updated = await dbStore.updateExpense(id, clean);
+    if (!updated) throw new Error('Expense not found.');
+    return updated;
+  });
+}
+
+export async function removeExpense(id: string): Promise<ActionResult<null>> {
+  return guard(async () => {
+    const session = await requireSession();
+    await assertCanModifyExpense(id, session);
+    await dbStore.deleteExpense(id);
+    return null;
+  });
 }
 
 // Advance Orders (partial-payment holds — not revenue until finalized)
