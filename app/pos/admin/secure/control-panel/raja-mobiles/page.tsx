@@ -7447,8 +7447,7 @@ export default function POSBilling() {
               <div className="bg-white border border-black/10 rounded-xl p-6 shadow-sm">
                 <p className="mb-4 text-[11px] font-bold text-[#B91C1C] bg-[#FEE2E2] border border-[#FCA5A5] rounded-lg px-3 py-2.5">
                   <span className="font-black">Note:</span> Whether you pick All, GST or Non-GST
-                  bills, these figures show only the product value (price × qty). GST is not
-                  included.
+                  bills, these figures show only the product value (price × qty).
                 </p>
                 <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-4">
                   <h3 className="font-bold text-[#000000] text-sm">
