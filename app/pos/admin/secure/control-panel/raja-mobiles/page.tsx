@@ -70,8 +70,6 @@ import {
   fetchCategories,
   createCategory,
   fetchExpenseCategories,
-  fetchExpenseSettings,
-  saveExpenseSettings,
   editExpense,
   fetchSession,
   logoutSession,
@@ -85,9 +83,8 @@ import {
   finalizeAdvanceOrder,
   setAdvanceOrderStatus,
 } from "@/app/pos/actions";
-import { ProductWithBatches, ProductBatch, ProductUnit, CartItem, Expense, ExpenseCategory, ExpenseSettings, ExpenseEditWindow, Category, AdvanceOrderWithRelations, AdvanceOrderStatus } from "@/lib/types";
+import { ProductWithBatches, ProductBatch, ProductUnit, CartItem, Expense, ExpenseCategory, Category, AdvanceOrderWithRelations, AdvanceOrderStatus } from "@/lib/types";
 import { effectiveGstRate, gstInside, isLegacyAddedGst } from "@/lib/gst";
-import { canModifyExpense, DEFAULT_EXPENSE_SETTINGS } from "@/lib/expensePolicy";
 import ProductCategoryInput from "./ProductCategoryInput";
 import ExpenseCategoryPicker, { FALLBACK_EXPENSE_CATEGORY } from "./ExpenseCategoryPicker";
 
@@ -437,8 +434,6 @@ const SearchableItemInput = ({
 export default function POSBilling() {
   const [isAuthorized, setIsAuthorized] = useState<boolean>(false);
   const [role, setRole] = useState<"staff" | "admin" | null>(null);
-  const [sessionName, setSessionName] = useState<string>(""); // staff name / "Admin", from the server session
-  const [staffNameInput, setStaffNameInput] = useState<string>("");
   const [passcode, setPasscode] = useState<string>("");
   const [passcodeError, setPasscodeError] = useState<string>("");
   const [showPasscode, setShowPasscode] = useState<boolean>(false);
@@ -574,7 +569,6 @@ export default function POSBilling() {
     localDateStr(),
   );
   const [isSavingExpense, setIsSavingExpense] = useState(false);
-  const [expenseSettings, setExpenseSettings] = useState<ExpenseSettings>(DEFAULT_EXPENSE_SETTINGS);
   const [editingExpenseId, setEditingExpenseId] = useState<string | null>(null);
   const [expensePeriod, setExpensePeriod] = useState<
     "all" | "today" | "week" | "month" | "year" | "custom"
@@ -633,7 +627,6 @@ export default function POSBilling() {
           sessionStorage.setItem("pos_authorized", "true");
           sessionStorage.setItem("pos_role", session.role);
           setRole(session.role);
-          setSessionName(session.name);
           if (session.role === "staff") setActiveTab("billing");
           setIsAuthorized(true);
         } else {
@@ -655,12 +648,11 @@ export default function POSBilling() {
 
   const handleVerifyPasscode = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    const result = await verifyPasscode(passcode, staffNameInput);
+    const result = await verifyPasscode(passcode);
     if (result && result.success) {
       sessionStorage.setItem("pos_authorized", "true");
       sessionStorage.setItem("pos_role", result.role || "admin");
       setRole(result.role as "staff" | "admin");
-      setSessionName(result.name || "");
       if (result.role === "staff") {
         setActiveTab("billing");
       }
@@ -668,14 +660,12 @@ export default function POSBilling() {
       setPasscode("");
       setPasscodeError("");
     } else {
-      setPasscodeError(result?.error || "Incorrect passcode. Please try again.");
+      setPasscodeError("Incorrect passcode. Please try again.");
     }
   };
 
   const handleLogout = () => {
     logoutSession().catch(() => {});
-    setSessionName("");
-    setStaffNameInput("");
     sessionStorage.removeItem("pos_authorized");
     localStorage.removeItem("pos_authorized");
     sessionStorage.removeItem("pos_role");
@@ -714,7 +704,7 @@ export default function POSBilling() {
   const fetchData = async () => {
     setIsRefreshing(true);
     try {
-      const [productsData, ordersData, expensesData, categoriesData, advanceData, expenseCategoriesData, expenseSettingsData] = await Promise.all([
+      const [productsData, ordersData, expensesData, categoriesData, advanceData, expenseCategoriesData] = await Promise.all([
         fetchProducts(),
         fetchOrders(),
         fetchExpenses(),
@@ -724,9 +714,7 @@ export default function POSBilling() {
           console.error("Error loading expense categories:", err);
           return [] as ExpenseCategory[];
         }),
-        fetchExpenseSettings().catch(() => DEFAULT_EXPENSE_SETTINGS),
       ]);
-      setExpenseSettings(expenseSettingsData);
       setExpenseCategories(expenseCategoriesData);
       setExpCategory((prev) =>
         prev && expenseCategoriesData.some((c) => c.name === prev)
@@ -1107,11 +1095,11 @@ export default function POSBilling() {
   // ── Product categories: toast + rename/delete callbacks ────────────
   const [toast, setToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const notify = useCallback((type: "success" | "error", message: string) => {
+  const notify = (type: "success" | "error", message: string) => {
     setToast({ type, message });
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     toastTimerRef.current = setTimeout(() => setToast(null), 4000);
-  }, []);
+  };
 
   const productCountByCategory = React.useMemo(() => {
     const counts: Record<string, number> = {};
@@ -2281,24 +2269,6 @@ export default function POSBilling() {
     setExpNotes("");
   };
 
-  // UI hint only — the server re-checks the same rule (canModifyExpense) on every edit/delete.
-  const canModifyExpenseRow = (e: Expense) =>
-    role !== null &&
-    canModifyExpense(e, { role, name: sessionName }, expenseSettings);
-
-  // Staff only see totals / Spend by Category when the admin turns it on.
-  const canSeeExpenseTotals = role === "admin" || expenseSettings.staffShowTotals;
-
-  const handleSaveExpenseSettings = async (next: ExpenseSettings) => {
-    const previous = expenseSettings;
-    setExpenseSettings(next);
-    const res = await saveExpenseSettings(next);
-    if (!res.ok) {
-      setExpenseSettings(previous);
-      alert(res.error);
-    }
-  };
-
   // Category manager callbacks. The server already rewrote expenses.category; mirror that in
   // local state so the filter, "Spend by Category" and the log update without a refetch.
   const handleExpenseCategoryCreated = (cat: ExpenseCategory) =>
@@ -3098,24 +3068,6 @@ export default function POSBilling() {
             onSubmit={handleVerifyPasscode}
             className="w-full space-y-6 text-left"
           >
-            <div className="space-y-3">
-              <label className="text-[9px] font-bold text-[#3F3F46] uppercase tracking-[0.25em] ml-1">
-                Your Name <span className="text-black/40 normal-case tracking-normal">(staff only)</span>
-              </label>
-              <input
-                type="text"
-                name="pos-staff-name"
-                autoComplete="off"
-                maxLength={40}
-                placeholder="e.g. Ravi"
-                className="w-full bg-[#FAFAFA] border border-black/10 hover:border-[#3F3F46]/50 focus:border-[#3F3F46] focus:bg-white rounded-2xl px-5 py-3.5 text-[#3F3F46] text-base focus:outline-none transition-all placeholder:text-black/20"
-                value={staffNameInput}
-                onChange={(e) => {
-                  setStaffNameInput(e.target.value);
-                  if (passcodeError) setPasscodeError("");
-                }}
-              />
-            </div>
             <div className="space-y-3">
               <label className="text-[9px] font-bold text-[#3F3F46] uppercase tracking-[0.25em] ml-1">
                 Security Passcode
@@ -7783,9 +7735,8 @@ export default function POSBilling() {
                   Expense Tracker
                 </h2>
                 <p className="text-xs text-[#000000] font-semibold mt-1">
-                  {role === "admin"
-                    ? "Record what the shop spends. Expenses are offset against sales to show your real Net Profit on the dashboard."
-                    : `Record what the shop spends. Logged in as ${sessionName || "staff"}.`}
+                  Record what the shop spends. Expenses are offset against sales
+                  to show your real Net Profit on the dashboard.
                 </p>
               </div>
               {/* Period filter */}
@@ -7843,7 +7794,6 @@ export default function POSBilling() {
             )}
 
             {/* Summary cards */}
-            {canSeeExpenseTotals && (
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
               <div className="rounded-2xl p-5 shadow-sm text-white bg-gradient-to-br from-[#3F3F46] to-[#18181B]">
                 <div className="flex justify-between items-start mb-2">
@@ -7898,61 +7848,12 @@ export default function POSBilling() {
                 </div>
               </div>
             </div>
-            )}
-
-            {/* Staff permissions (admin only; enforced again on the server) */}
-            {role === "admin" && (
-              <div className="bg-white border border-black/10 rounded-2xl p-4 shadow-sm mb-6">
-                <h3 className="text-xs font-black text-[#000000] uppercase tracking-wider flex items-center gap-2 mb-3">
-                  <Shield className="w-4 h-4 text-[#3F3F46]" />
-                  Staff permissions
-                </h3>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-[10px] font-bold uppercase tracking-wider text-[#000000] mb-1">
-                      Staff can edit / delete their own expenses
-                    </label>
-                    <select
-                      value={expenseSettings.staffEditWindow}
-                      onChange={(e) =>
-                        handleSaveExpenseSettings({
-                          ...expenseSettings,
-                          staffEditWindow: e.target.value as ExpenseEditWindow,
-                        })
-                      }
-                      className="w-full bg-[#FAFAFA] border border-black/10 rounded-lg px-3 py-2.5 text-sm text-[#000000] focus:outline-none focus:border-[#3F3F46] cursor-pointer"
-                    >
-                      <option value="same_day">Same day only</option>
-                      <option value="24h">Within 24 hours</option>
-                      <option value="7d">Within 7 days</option>
-                      <option value="never">Never</option>
-                    </select>
-                  </div>
-                  <label className="flex items-center gap-3 cursor-pointer min-h-11 sm:self-end">
-                    <input
-                      type="checkbox"
-                      checked={expenseSettings.staffShowTotals}
-                      onChange={(e) =>
-                        handleSaveExpenseSettings({
-                          ...expenseSettings,
-                          staffShowTotals: e.target.checked,
-                        })
-                      }
-                      className="w-5 h-5 accent-[#3F3F46]"
-                    />
-                    <span className="text-sm font-semibold text-[#000000]">
-                      Let staff see totals &amp; Spend by Category
-                    </span>
-                  </label>
-                </div>
-              </div>
-            )}
 
             {/* Two-column: add form + category breakdown */}
             <div className="grid grid-cols-1 lg:grid-cols-5 gap-6 mb-6">
               {/* Add expense form */}
               <div
-                className={`${canSeeExpenseTotals ? "lg:col-span-2" : "lg:col-span-5 lg:max-w-xl"} bg-white border ${editingExpenseId ? "border-[#3F3F46]" : "border-black/10"} rounded-2xl p-5 shadow-sm h-fit`}
+                className={`lg:col-span-2 bg-white border ${editingExpenseId ? "border-[#3F3F46]" : "border-black/10"} rounded-2xl p-5 shadow-sm h-fit`}
               >
                 <h3 className="text-sm font-black text-[#000000] uppercase tracking-wider flex items-center gap-2 mb-4">
                   <span className="w-1.5 h-6 bg-[#3F3F46] rounded-full" />
@@ -8068,7 +7969,6 @@ export default function POSBilling() {
               </div>
 
               {/* Category breakdown */}
-              {canSeeExpenseTotals && (
               <div className="lg:col-span-3 bg-white border border-black/10 rounded-2xl p-5 shadow-sm">
                 <h3 className="text-sm font-black text-[#000000] uppercase tracking-wider flex items-center gap-2 mb-4">
                   <span className="w-1.5 h-6 bg-[#3F3F46] rounded-full" />
@@ -8123,7 +8023,6 @@ export default function POSBilling() {
                   </div>
                 )}
               </div>
-              )}
             </div>
 
             {/* Expenses list */}
@@ -8290,11 +8189,6 @@ export default function POSBilling() {
                             )}
                           </div>
                         </th>
-                        {role === "admin" && (
-                          <th className="p-3 text-[10px] font-black text-[#000000] uppercase tracking-wider">
-                            Added by
-                          </th>
-                        )}
                         <th
                           onClick={() => {
                             if (expenseSortField === "amount") {
@@ -8319,9 +8213,11 @@ export default function POSBilling() {
                             )}
                           </div>
                         </th>
-                        <th className="p-3 text-[10px] font-black text-[#000000] uppercase tracking-wider text-center">
-                          Action
-                        </th>
+                        {role === "admin" && (
+                          <th className="p-3 text-[10px] font-black text-[#000000] uppercase tracking-wider text-center">
+                            Action
+                          </th>
+                        )}
                       </tr>
                     </thead>
                     <tbody>
@@ -8359,30 +8255,6 @@ export default function POSBilling() {
                               {e.payment_mode}
                             </span>
                           </td>
-                          {role === "admin" && (
-                            <td className="p-3 whitespace-nowrap">
-                              <p className="text-xs font-bold text-[#000000]">
-                                {e.created_by || "—"}
-                                {e.created_by_role === "staff" && (
-                                  <span className="ml-1.5 text-[9px] font-black uppercase tracking-wider text-[#3F3F46] bg-[#3F3F46]/10 px-1.5 py-0.5 rounded">
-                                    Staff
-                                  </span>
-                                )}
-                              </p>
-                              {e.created_at && (
-                                <p className="text-[10px] text-[#000000]/50 font-semibold mt-0.5">
-                                  {new Date(e.created_at).toLocaleString("en-IN", {
-                                    day: "2-digit",
-                                    month: "short",
-                                    hour: "numeric",
-                                    minute: "2-digit",
-                                    hour12: true,
-                                    timeZone: "Asia/Kolkata",
-                                  })}
-                                </p>
-                              )}
-                            </td>
-                          )}
                           <td className="p-3 text-right text-sm font-black text-[#B91C1C] whitespace-nowrap">
                             − ₹
                             {e.amount.toLocaleString("en-IN", {
@@ -8390,8 +8262,8 @@ export default function POSBilling() {
                               maximumFractionDigits: 2,
                             })}
                           </td>
+                          {role === "admin" && (
                           <td className="p-3 text-center whitespace-nowrap">
-                            {canModifyExpenseRow(e) ? (
                               <div className="inline-flex items-center gap-2">
                                 <button
                                   onClick={() => handleStartEditExpense(e)}
@@ -8410,18 +8282,15 @@ export default function POSBilling() {
                                   <Trash2 className="w-4 h-4" />
                                 </button>
                               </div>
-                            ) : (
-                              <span className="text-black/20 text-xs">—</span>
-                            )}
                           </td>
+                          )}
                         </tr>
                       ))}
                     </tbody>
-                    {canSeeExpenseTotals && (
                     <tfoot>
                       <tr className="bg-[#FAFAFA] border-t border-black/10">
                         <td
-                          colSpan={role === "admin" ? 5 : 4}
+                          colSpan={4}
                           className="p-3 text-[10px] font-black text-[#000000] uppercase tracking-wider text-right"
                         >
                           Total ({expensePeriod})
@@ -8433,10 +8302,9 @@ export default function POSBilling() {
                             maximumFractionDigits: 2,
                           })}
                         </td>
-                        <td />
+                        {role === "admin" && <td />}
                       </tr>
                     </tfoot>
-                    )}
                   </table>
                 </div>
               )}

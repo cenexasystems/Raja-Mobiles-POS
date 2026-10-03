@@ -14,7 +14,6 @@ import {
   CartItem,
   Expense,
   ExpenseCategory,
-  ExpenseSettings,
   PaymentMode,
   AdvanceOrderRow,
   AdvanceOrderItemRow,
@@ -22,7 +21,6 @@ import {
   AdvanceOrderWithRelations,
 } from './types';
 import { effectiveGstRate, gstInside } from './gst';
-import { DEFAULT_EXPENSE_SETTINGS } from './expensePolicy';
 
 // orders.bill_date is a Postgres DATE. The shop runs on India time, so turn whatever the client
 // sent (a plain YYYY-MM-DD, or a full ISO timestamp) into the IST calendar day. Casting a UTC ISO
@@ -506,20 +504,6 @@ export const dbStore = {
           SELECT gen_random_uuid()::text, c, 100
           FROM (SELECT DISTINCT TRIM(category) AS c FROM expenses WHERE TRIM(category) <> '') s
           ON CONFLICT DO NOTHING`;
-        // 002: audit columns + settings (db/migrations/002_expense_audit_and_settings.sql)
-        await sql`ALTER TABLE expenses ADD COLUMN IF NOT EXISTS created_by TEXT`;
-        await sql`ALTER TABLE expenses ADD COLUMN IF NOT EXISTS created_by_role TEXT`;
-        await sql`
-          CREATE TABLE IF NOT EXISTS app_settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-          )`;
-        await sql`
-          INSERT INTO app_settings (key, value) VALUES
-            ('staff_expense_edit_window', 'same_day'),
-            ('staff_expense_show_totals', 'false')
-          ON CONFLICT (key) DO NOTHING`;
       })().catch((e) => {
         expenseCategoriesReady = null;
         throw e;
@@ -604,47 +588,18 @@ export const dbStore = {
     payment_mode: string;
     notes: string | null;
     expense_date: string;
-    created_by: string;
-    created_by_role: 'admin' | 'staff';
   }): Promise<Expense> {
     await this.ensureExpenseSchema();
     const id = uid();
     const rows = await sql`
-      INSERT INTO expenses (id, title, category, amount, payment_mode, notes, expense_date, created_by, created_by_role)
+      INSERT INTO expenses (id, title, category, amount, payment_mode, notes, expense_date)
       VALUES (
         ${id}, ${input.title}, ${input.category}, ${input.amount},
-        ${input.payment_mode}, ${input.notes}, ${input.expense_date},
-        ${input.created_by}, ${input.created_by_role}
+        ${input.payment_mode}, ${input.notes}, ${input.expense_date}
       )
       RETURNING *
     `;
     return rows[0] as Expense;
-  },
-
-  // EXPENSE SETTINGS (adjustable staff permissions)
-  async getExpenseSettings(): Promise<ExpenseSettings> {
-    await this.ensureExpenseSchema();
-    const rows = await sql`
-      SELECT key, value FROM app_settings
-      WHERE key IN ('staff_expense_edit_window', 'staff_expense_show_totals')`;
-    const map = Object.fromEntries(rows.map((r) => [r.key as string, r.value as string]));
-    const win = map['staff_expense_edit_window'];
-    return {
-      staffEditWindow: (['same_day', '24h', '7d', 'never'] as const).find((w) => w === win)
-        ?? DEFAULT_EXPENSE_SETTINGS.staffEditWindow,
-      staffShowTotals: map['staff_expense_show_totals'] === 'true',
-    };
-  },
-
-  async setExpenseSettings(s: ExpenseSettings): Promise<ExpenseSettings> {
-    await this.ensureExpenseSchema();
-    await sql.transaction([
-      sql`INSERT INTO app_settings (key, value) VALUES ('staff_expense_edit_window', ${s.staffEditWindow})
-          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
-      sql`INSERT INTO app_settings (key, value) VALUES ('staff_expense_show_totals', ${s.staffShowTotals ? 'true' : 'false'})
-          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
-    ]);
-    return s;
   },
 
   async updateExpense(id: string, patch: Partial<Expense>): Promise<Expense | null> {

@@ -2,8 +2,7 @@
 
 import { dbStore } from "@/lib/dbStore";
 import { requireSession, requireAdmin, getSession, startSession, endSession, Session } from "@/lib/auth";
-import { canModifyExpense } from "@/lib/expensePolicy";
-import { Product, ProductBatch, ProductWithBatches, ProductUnit, OrderWithRelations, CartItem, Expense, ExpenseCategory, ExpenseSettings, ActionResult, PaymentMode, Category, Gift, AdvanceOrderWithRelations, AdvanceOrderStatus } from "@/lib/types";
+import { Product, ProductBatch, ProductWithBatches, ProductUnit, OrderWithRelations, CartItem, Expense, ExpenseCategory, ActionResult, PaymentMode, Category, Gift, AdvanceOrderWithRelations, AdvanceOrderStatus } from "@/lib/types";
 
 // Helper to serialize Date objects from Postgres to strings
 function serialize<T>(data: T): T {
@@ -15,22 +14,19 @@ function serialize<T>(data: T): T {
 // Role and staff name come from a signed httpOnly cookie (lib/auth.ts), never from the client.
 export async function verifyPasscode(
   enteredPasscode: string,
-  staffName?: string,
-): Promise<{ success: boolean; role?: 'staff' | 'admin'; name?: string; error?: string }> {
+): Promise<{ success: boolean; role?: 'staff' | 'admin' }> {
   const adminPasscode = process.env.ADMIN_PASSCODE || "admin123";
   const staffPasscode = process.env.STAFF_PASSCODE || process.env.NEXT_PUBLIC_STAFF_PASSCODE || "staff123";
 
   const normalizedEntered = enteredPasscode.replace(/\s/g, "");
 
   if (normalizedEntered === adminPasscode) {
-    await startSession({ role: 'admin', name: 'Admin' });
-    return { success: true, role: 'admin', name: 'Admin' };
+    await startSession({ role: 'admin' });
+    return { success: true, role: 'admin' };
   }
   if (normalizedEntered === staffPasscode) {
-    const name = (staffName || '').trim().replace(/\s+/g, ' ').slice(0, 40);
-    if (!name) return { success: false, error: 'Please enter your name.' };
-    await startSession({ role: 'staff', name });
-    return { success: true, role: 'staff', name };
+    await startSession({ role: 'staff' });
+    return { success: true, role: 'staff' };
   }
 
   return { success: false };
@@ -230,25 +226,6 @@ export async function removeExpenseCategory(id: string): Promise<ActionResult<{ 
   });
 }
 
-// ── Expense settings (adjustable staff permissions) ─────────────────
-export async function fetchExpenseSettings(): Promise<ExpenseSettings> {
-  await requireSession();
-  return await dbStore.getExpenseSettings();
-}
-
-export async function saveExpenseSettings(settings: ExpenseSettings): Promise<ActionResult<ExpenseSettings>> {
-  return guard(async () => {
-    await requireAdmin();
-    if (!['same_day', '24h', '7d', 'never'].includes(settings.staffEditWindow)) {
-      throw new Error('Invalid edit window.');
-    }
-    return await dbStore.setExpenseSettings({
-      staffEditWindow: settings.staffEditWindow,
-      staffShowTotals: Boolean(settings.staffShowTotals),
-    });
-  });
-}
-
 // ── Expenses ────────────────────────────────────────────────────────
 const EXPENSE_PAYMENT_MODES = ['CASH', 'UPI', 'CARD', 'BANK', 'OTHER'];
 
@@ -289,35 +266,18 @@ export async function fetchExpenses(): Promise<Expense[]> {
   return serialize(await dbStore.listExpenses());
 }
 
-// created_by / created_by_role always come from the session, never from the client.
+// Staff and admin can add expenses; only admin can edit or delete them (checked on the server).
 export async function createExpense(data: ExpenseInput): Promise<ActionResult<Expense>> {
   return guard(async () => {
-    const session = await requireSession();
-    const clean = await cleanExpenseInput(data);
-    return await dbStore.addExpense({
-      ...clean,
-      created_by: session.name,
-      created_by_role: session.role,
-    });
+    await requireSession();
+    return await dbStore.addExpense(await cleanExpenseInput(data));
   });
-}
-
-// Checks the caller may modify the expense (admin: any; staff: own, inside the allowed window).
-async function assertCanModifyExpense(id: string, session: Session): Promise<void> {
-  const expense = await dbStore.getExpense(id);
-  if (!expense) throw new Error('Expense not found.');
-  const settings = await dbStore.getExpenseSettings();
-  if (!canModifyExpense(expense, session, settings)) {
-    throw new Error('You can only change expenses you added, within the allowed time.');
-  }
 }
 
 export async function editExpense(id: string, data: ExpenseInput): Promise<ActionResult<Expense>> {
   return guard(async () => {
-    const session = await requireSession();
-    await assertCanModifyExpense(id, session);
+    await requireAdmin();
     const clean = await cleanExpenseInput(data);
-    // Only these fields are writable; created_by / created_at never change.
     const updated = await dbStore.updateExpense(id, clean);
     if (!updated) throw new Error('Expense not found.');
     return updated;
@@ -326,8 +286,7 @@ export async function editExpense(id: string, data: ExpenseInput): Promise<Actio
 
 export async function removeExpense(id: string): Promise<ActionResult<null>> {
   return guard(async () => {
-    const session = await requireSession();
-    await assertCanModifyExpense(id, session);
+    await requireAdmin();
     await dbStore.deleteExpense(id);
     return null;
   });

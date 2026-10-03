@@ -4,7 +4,7 @@ import { cookies } from 'next/headers';
 // Server-side session. The role used to live only in sessionStorage, which the browser (and anyone
 // with devtools) controls. Server actions now trust ONLY this signed, httpOnly cookie.
 
-export type Session = { role: 'admin' | 'staff'; name: string };
+export type Session = { role: 'admin' | 'staff' };
 
 const COOKIE_NAME = 'pos_session';
 const MAX_AGE_SECONDS = 12 * 60 * 60;
@@ -17,7 +17,7 @@ const sign = (payload: string) => createHmac('sha256', secret()).update(payload)
 
 export async function startSession(session: Session): Promise<void> {
   const payload = Buffer.from(
-    JSON.stringify({ r: session.role, n: session.name, e: Date.now() + MAX_AGE_SECONDS * 1000 }),
+    JSON.stringify({ r: session.role, e: Date.now() + MAX_AGE_SECONDS * 1000 }),
   ).toString('base64url');
   (await cookies()).set(COOKIE_NAME, `${payload}.${sign(payload)}`, {
     httpOnly: true,
@@ -44,7 +44,7 @@ export async function getSession(): Promise<Session | null> {
     const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
     if (typeof data.e !== 'number' || data.e < Date.now()) return null;
     if (data.r !== 'admin' && data.r !== 'staff') return null;
-    return { role: data.r, name: String(data.n || '') };
+    return { role: data.r };
   } catch {
     return null;
   }
