@@ -2458,6 +2458,15 @@ export default function POSBilling() {
     const now = new Date();
 
     // GST dashboard scope: "all" bills, GST invoices only, or non-GST bills only.
+    // Analytics figures use product value only (price x qty); GST rows, discount
+    // and delivery fee are excluded.
+    const productValue = (o: CompletedOrder) =>
+      o.items.reduce(
+        (sum, i) =>
+          i.name && i.name.startsWith("GST (") ? sum : sum + i.price * i.qty,
+        0,
+      );
+
     const passesGst = (o: CompletedOrder) =>
       analyticsGstFilter === "all" ||
       (analyticsGstFilter === "gst" ? o.isGst : !o.isGst);
@@ -2516,7 +2525,7 @@ export default function POSBilling() {
 
     const totalOrdersCount = analyticsFilteredOrders.length;
     const totalRevenueAmount = analyticsFilteredOrders.reduce(
-      (acc, o) => acc + o.grandTotal,
+      (acc, o) => acc + productValue(o),
       0,
     );
     const avgOrderValue =
@@ -2524,9 +2533,9 @@ export default function POSBilling() {
 
     const gstOrders = analyticsFilteredOrders.filter((o) => o.isGst);
     const nonGstOrders = analyticsFilteredOrders.filter((o) => !o.isGst);
-    const gstRevenue = gstOrders.reduce((acc, o) => acc + o.grandTotal, 0);
+    const gstRevenue = gstOrders.reduce((acc, o) => acc + productValue(o), 0);
     const nonGstRevenue = nonGstOrders.reduce(
-      (acc, o) => acc + o.grandTotal,
+      (acc, o) => acc + productValue(o),
       0,
     );
     const gstOrdersCount = gstOrders.length;
@@ -2543,10 +2552,10 @@ export default function POSBilling() {
     // Split revenues
     const onlineRevenue = analyticsFilteredOrders
       .filter((o) => o.source === "ONLINE")
-      .reduce((acc, o) => acc + o.grandTotal, 0);
+      .reduce((acc, o) => acc + productValue(o), 0);
     const offlineRevenue = analyticsFilteredOrders
       .filter((o) => o.source === "OFFLINE")
-      .reduce((acc, o) => acc + o.grandTotal, 0);
+      .reduce((acc, o) => acc + productValue(o), 0);
 
     // Top items by revenue in analyticsFilteredOrders
     const itemSales: Record<
@@ -2632,7 +2641,7 @@ export default function POSBilling() {
         orderTime <= sundayOfThisWeek.getTime()
       ) {
         const day = (orderDate.getDay() + 6) % 7;
-        weekRevenue[day] += order.grandTotal;
+        weekRevenue[day] += productValue(order);
       }
     });
     const maxWeekRevenue = Math.max(...weekRevenue, 1);
@@ -2665,7 +2674,7 @@ export default function POSBilling() {
       }
       const d = new Date(order.date);
       if (d.getFullYear() === now.getFullYear()) {
-        monthRevenue[d.getMonth()] += order.grandTotal;
+        monthRevenue[d.getMonth()] += productValue(order);
       }
     });
     const maxMonthRevenue = Math.max(...monthRevenue, 1);
@@ -2691,7 +2700,7 @@ export default function POSBilling() {
       );
     });
 
-    const todayRevenue = todayOrders.reduce((acc, o) => acc + o.grandTotal, 0);
+    const todayRevenue = todayOrders.reduce((acc, o) => acc + productValue(o), 0);
 
     const todayOrdersCount = todayOrders.length;
     const todayOnlineOrdersCount = todayOrders.filter(
@@ -2703,10 +2712,10 @@ export default function POSBilling() {
 
     const todayOnlineRevenue = todayOrders
       .filter((o) => o.source === "ONLINE")
-      .reduce((acc, o) => acc + o.grandTotal, 0);
+      .reduce((acc, o) => acc + productValue(o), 0);
     const todayOfflineRevenue = todayOrders
       .filter((o) => o.source === "OFFLINE")
-      .reduce((acc, o) => acc + o.grandTotal, 0);
+      .reduce((acc, o) => acc + productValue(o), 0);
 
     const todayItemsSold = todayOrders.reduce(
       (acc, o) =>
@@ -2745,7 +2754,7 @@ export default function POSBilling() {
           d.getFullYear() === now.getFullYear()
         );
       })
-      .reduce((acc, o) => acc + o.grandTotal, 0);
+      .reduce((acc, o) => acc + productValue(o), 0);
 
     const totalItemsSold = analyticsFilteredOrders.reduce(
       (acc, o) =>
@@ -6570,6 +6579,11 @@ export default function POSBilling() {
               })}
             </div>
 
+            <p className="text-[11px] font-semibold text-[#000000]/70 -mt-3 mb-6">
+              Note: Whether you pick All, GST or Non-GST bills, these figures
+              show only the product value (price x qty).
+            </p>
+
             {/* Sub Navigation Tabs */}
             <div className="flex border-b border-black/10 mb-6 gap-6 overflow-x-auto scrollbar-none pb-0.5 w-full shrink-0">
               {(["revenue", "today", "products", "coupons"] as const).map(
@@ -6744,7 +6758,15 @@ export default function POSBilling() {
                                     pcs
                                   </td>
                                   <td className="p-3 text-xs font-black text-[#3F3F46] text-right">
-                                    ₹{order.grandTotal.toLocaleString()}
+                                    ₹{order.items
+                                      .reduce(
+                                        (sum, i) =>
+                                          i.name && i.name.startsWith("GST (")
+                                            ? sum
+                                            : sum + i.price * i.qty,
+                                        0,
+                                      )
+                                      .toLocaleString()}
                                   </td>
                                 </tr>
                               ))}
